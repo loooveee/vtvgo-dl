@@ -24,7 +24,7 @@ Tải video, cả bộ phim, cả trang, xem lại chương trình truyền hìn
   - tải lại chương trình đã phát (`--program`)
   - ghi trực tiếp (`--duration`, hoặc bấm Ctrl+C để dừng)
   - video livestream / restream được tự động ghi lại
-- **Nhanh, tải tiếp được**: tải song song bằng aria2c (không có thì dùng requests). Chạy lại đúng lệnh cũ để tải tiếp. Link lỗi được ghi vào `failed.txt`.
+- **Nhanh, tải tiếp được**: tải song song bằng aria2c (không có thì dùng requests). Chạy lại đúng lệnh cũ để tải tiếp. Link lỗi được ghi vào `failed.txt`; `-a failed.txt` sẽ tải lại chúng.
 - **Đăng nhập**: `--login` mở cửa sổ trình duyệt để *bạn tự* đăng nhập. Sau đó tải được cả video cần tài khoản hoặc cần mua gói.
 
 ## Cài đặt
@@ -74,7 +74,7 @@ python vtvgo-dl.py -F https://vtvgo.vn/watch/576y
 | `--no-images`, `--no-subs` | bỏ qua ảnh hoặc phụ đề |
 | `-j 16` | số đoạn tải song song |
 | `--proxy URL` | proxy cho mọi kết nối |
-| `-a file.txt` | đọc danh sách link từ file |
+| `-a file.txt` | đọc danh sách link từ file (mỗi dòng một link, `#` là ghi chú) |
 | `--login` / `--logout` | đăng nhập / xoá phiên đã lưu |
 | `--lang vi` | thông báo tiếng Việt |
 

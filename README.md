@@ -24,7 +24,7 @@ Download videos, whole series, whole pages, TV catch-up and live channels from [
   - catch-up of finished programs (`--program`)
   - live recording (`--duration`, or stop with Ctrl+C)
   - livestream / restream videos, which are recorded automatically
-- **Fast and resumable**: parallel segments through aria2c (falls back to requests). Run the same command again to resume. Failures go to `failed.txt`.
+- **Fast and resumable**: parallel segments through aria2c (falls back to requests). Run the same command again to resume. Failures go to `failed.txt`; `-a failed.txt` retries them.
 - **Login**: `--login` opens a browser window where *you* log in. Videos that need an account or a paid plan then work too.
 
 ## Install
@@ -74,7 +74,7 @@ python vtvgo-dl.py -F https://vtvgo.vn/watch/576y
 | `--no-images`, `--no-subs` | skip artwork or subtitles |
 | `-j 16` | parallel segment downloads |
 | `--proxy URL` | proxy for all requests |
-| `-a file.txt` | read links from a file |
+| `-a file.txt` | read links from a file (one per line, `#` starts a comment) |
 | `--login` / `--logout` | log in / delete the saved session |
 | `--lang vi` | Vietnamese messages |
 
