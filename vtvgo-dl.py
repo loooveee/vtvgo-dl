@@ -351,7 +351,9 @@ _TOKEN_PATH = re.compile(r"/[A-Za-z0-9_-]{16,}/\d{10}(?=/)")     # /<signature>/
 _SIGNED_QUERY = re.compile(r"(token|sig|hmac|hdnts|hdntl|policy|key-pair|expires|exp|auth|st|e|acl)=", re.I)
 _MEDIA_PATH = re.compile(r"\.(m3u8|mpd|ts|m4s|mp4|aac|key|vtt)$", re.I)
 _URL = re.compile(r"https?://[^\s\"'<>]+")
-_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}\b")
+_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"                                   # IPv4
+                 r"|\b(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}\b"                    # IPv6, full
+                 r"|\b(?:[0-9a-fA-F]{1,4}:)+:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?(?![\w:])")  # IPv6 with ::
 
 
 def _redact_url(match: re.Match) -> str:
@@ -461,6 +463,14 @@ def names_of(items) -> list[str]:
         if it:
             out.append(str(it))
     return out
+
+
+def as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value) -> list:
+    return value if isinstance(value, list) else []
 
 
 def as_int(value, default: int = 0) -> int:
@@ -689,7 +699,7 @@ class Api:
         """Every episode of a series (GROUP_VIDEO). The API wants episode ranges: walk them 50 at a time,
         and stop after two empty ranges past the known episode count."""
         total = as_int(series.get("currentEpisodeCount") or series.get("totalEpisode"))
-        first = as_int((series.get("firstEpisode") or {}).get("episodeNumber"), 1) or 1
+        first = as_int(as_dict(series.get("firstEpisode")).get("episodeNumber"), 1) or 1
         out: dict[str, dict] = {}
         start, step, empty = max(1, first), 50, 0
         while start < 100_000 and empty < 2:
@@ -700,7 +710,7 @@ class Api:
                 if e.code not in ("NOT_FOUND", "VOD_NOT_FOUND"):
                     raise
                 data = []
-            items = data.get("items", []) if isinstance(data, dict) else (data or [])
+            items = as_list(data.get("items")) if isinstance(data, dict) else as_list(data)
             items = [it for it in items if isinstance(it, dict) and it.get("id")]
             for it in items:
                 out[it["id"]] = it
@@ -844,13 +854,13 @@ def parse_input(text: str) -> tuple[str, str]:
 
 def block_ids(api: Api, block: dict, limit: Optional[int]) -> list[str]:
     """VOD ids of one page block (a catalog node or a hand-picked list)."""
-    extra = block.get("extraData") or {}
+    extra = as_dict(block.get("extraData"))
     kind = extra.get("contentType") or block.get("type")
     if kind == "vod" and extra.get("nodeId"):
-        return [i["id"] for i in api.node(str(extra["nodeId"]), limit)]
+        return [str(i["id"]) for i in api.node(str(extra["nodeId"]), limit)]
     if kind == "manual":
         ids = []
-        for it in (extra.get("filter") or {}).get("manualItems") or []:
+        for it in as_list(as_dict(extra.get("filter")).get("manualItems")):
             it = it.get("id") or it.get("vodID") if isinstance(it, dict) else it
             if it:
                 ids.append(str(it))
@@ -882,8 +892,8 @@ def expand(api: Api, kind: str, value: str, opts) -> list[Job]:
                 if not opts.recursive:
                     skipped_sub = True
                     continue
-                for it in b.get("items") or []:
-                    target = it.get("target") or {}
+                for it in as_list(b.get("items")):
+                    target = as_dict(as_dict(it).get("target"))
                     pid = target.get("sourceModeID") or target.get("slug")
                     if pid and pid not in seen and depth < 2:
                         seen.add(pid)
@@ -908,8 +918,8 @@ def series_of(detail: dict) -> Optional[dict]:
     """The series a VOD belongs to (or the VOD itself when it is the series)."""
     if detail.get("type") == "GROUP_VIDEO":
         return detail
-    pm = detail.get("parentMetadata")
-    return pm if isinstance(pm, dict) and pm.get("id") and pm.get("title") else None
+    pm = as_dict(detail.get("parentMetadata"))
+    return pm if pm.get("id") and pm.get("title") else None
 
 
 def collect_jobs(api: Api, inputs: list[tuple[str, str]], opts) -> list[Job]:
@@ -921,10 +931,13 @@ def collect_jobs(api: Api, inputs: list[tuple[str, str]], opts) -> list[Job]:
         except VtvgoError as e:
             log(red(f"{value}: {e}"))
             continue
+        except Exception as e:                   # odd API data: report it, keep the other inputs
+            log(red(f"{value}: {type(e).__name__}: {one_line(e)}"))
+            continue
         for job in found:
             try:
                 d = api.detail(job.vod_id)
-            except VtvgoError:
+            except Exception:
                 jobs.append(job)               # reported when the job runs
                 continue
             series = d if d.get("type") == "GROUP_VIDEO" else (series_of(d) if opts.whole_series else None)
@@ -970,6 +983,7 @@ class Variant:
     codecs: str = ""
     audio: Optional[str] = None       # separate audio playlist
     source: str = ""                  # CDN label
+    parent: Optional[str] = None      # the master playlist it was listed in
 
     @property
     def label(self) -> str:
@@ -979,7 +993,7 @@ class Variant:
 
     def safe(self) -> dict:
         """For .info.json: without the signed parts of the links."""
-        return scrub(self.__dict__)
+        return scrub({k: v for k, v in self.__dict__.items() if k != "parent"})
 
 
 def inherit_query(child: str, parent: str) -> str:
@@ -1040,20 +1054,22 @@ def parse_master(text: str, base: str, source: str = "") -> list[Variant]:
         w, _, h = a.get("RESOLUTION", "0x0").lower().partition("x")
         out.append(Variant(urljoin(base, uri), as_int(a.get("BANDWIDTH") or a.get("AVERAGE-BANDWIDTH")),
                            as_int(w), as_int(h), a.get("FRAME-RATE", "").split(".")[0], a.get("CODECS", ""),
-                           audio.get(a.get("AUDIO", "")), source))
+                           audio.get(a.get("AUDIO", "")), source, base))
     return out
 
 
 def stream_urls(src: dict) -> list[tuple[str, str, str]]:
     """(url, manifest type, cdn) of every clear source, in the order the API gives them."""
     clear, drm_only = [], []
-    for mode in src.get("sourceModes") or []:
+    for mode in as_list(src.get("sourceModes")):
         if not isinstance(mode, dict):
             continue
-        for grp in mode.get("multiSource") or [mode]:
-            drm = str((grp.get("drmInfo") or mode.get("drmInfo") or {}).get("drmType") or "none").lower()
-            kind = grp.get("manifestType") or mode.get("manifestType") or ""
-            for s in grp.get("sources") or []:
+        for grp in as_list(mode.get("multiSource")) or [mode]:
+            if not isinstance(grp, dict):
+                continue
+            drm = str(as_dict(grp.get("drmInfo") or mode.get("drmInfo")).get("drmType") or "none").lower()
+            kind = str(grp.get("manifestType") or mode.get("manifestType") or "")
+            for s in as_list(grp.get("sources")):
                 if isinstance(s, dict) and s.get("url"):
                     (clear if drm in CLEAR_DRM else drm_only).append((s["url"], kind, s.get("cdnID") or ""))
     if src.get("sourceUrl"):
@@ -1112,6 +1128,7 @@ class Segment:
     url: str
     dest: Path
     kind: str = "media"          # media | encrypted (media under an EXT-X-KEY) | key | init
+    ts: bool = False             # the source is an MPEG-TS file (its first byte must be the sync byte)
 
 
 @dataclass
@@ -1122,19 +1139,37 @@ class MediaPlaylist:
     live: bool = False
 
 
+SEGMENT_EXTS = (".ts", ".m4s", ".mp4", ".m4v", ".m4a", ".aac", ".cmfv", ".cmfa", ".mp3", ".vtt")
+
+
+def needs_query(http: Http, url: str, playlist: str) -> bool:
+    """Does this CDN want the playlist's query string (its signature) on every child URL? Tried on the
+    first one: refused without it, accepted with it."""
+    if not urlparse(playlist).query or urlparse(url).query:
+        return False
+    def status(u: str) -> int:
+        try:
+            with http.s.get(u, stream=True, timeout=30) as r:
+                return r.status_code
+        except requests.RequestException:
+            return 0
+    return status(url) in (401, 403) and status(inherit_query(url, playlist)) == 200
+
+
 def plan_media(http: Http, variant: Variant, folder: Path, prefix: str, quality: str,
                url: Optional[str] = None) -> tuple[MediaPlaylist, Variant]:
     """Read a media playlist and plan the download of every segment, key and init section.
     Returns the plan and the variant really used (a "media" URL that turns out to be a master is
     resolved with the same --quality)."""
     url = url or variant.url
-    text, final = http.text(url, parent=variant.url if url != variant.url else None)
+    text, final = http.text(url, parent=variant.parent or (variant.url if url != variant.url else None))
     if "#EXT-X-STREAM-INF" in text:
         inner = pick_variant(parse_master(text, final, variant.source), quality)
         return plan_media(http, inner, folder, prefix, quality, inherit_query(inner.url, final)
                           if urlparse(final).query else inner.url)
     out, segs = [], []
-    n_seg = n_key = 0
+    side: dict[str, Path] = {}                 # key / init URI -> local file (packagers repeat the tag)
+    n_seg = 0
     encrypted = False
     for raw in text.splitlines():
         ln = raw.strip()
@@ -1145,24 +1180,30 @@ def plan_media(http: Http, variant: Variant, folder: Path, prefix: str, quality:
             if ln.startswith("#EXT-X-KEY"):
                 encrypted = a.get("METHOD", "NONE").upper() != "NONE"
             if a.get("URI") and a.get("METHOD", "").upper() != "NONE":
-                n_key += 1
-                kind = "key" if ln.startswith("#EXT-X-KEY") else "init"
-                dest = folder / f"{prefix}{n_key:03d}.{kind}"
-                segs.append(Segment(urljoin(final, a["URI"]), dest, kind))
-                ln = ln.replace(f'URI="{a["URI"]}"', f'URI="{dest.name}"')
+                full = urljoin(final, a["URI"])
+                if full not in side:
+                    kind = "key" if ln.startswith("#EXT-X-KEY") else "init"
+                    side[full] = folder / f"{prefix}{len(side) + 1:03d}.{kind}"
+                    segs.append(Segment(full, side[full], kind))
+                ln = ln.replace(f'URI="{a["URI"]}"', f'URI="{side[full].name}"')
             out.append(ln)
         elif ln.startswith("#"):
             out.append(ln)
         else:
             n_seg += 1
             ext = Path(urlparse(ln).path).suffix.lower()
-            ext = ext if ext in (".ts", ".m4s", ".mp4", ".aac", ".m4a") else ".ts"
-            dest = folder / f"{prefix}{n_seg:05d}{ext}"
-            segs.append(Segment(urljoin(final, ln), dest, "encrypted" if encrypted else "media"))
+            dest = folder / f"{prefix}{n_seg:05d}{ext if ext in SEGMENT_EXTS else '.seg'}"
+            segs.append(Segment(urljoin(final, ln), dest, "encrypted" if encrypted else "media", ext == ".ts"))
             out.append(dest.name)
     if not n_seg:
         raise VtvgoError(t("empty playlist", "danh sách phát rỗng"))
     live = "#EXT-X-ENDLIST" not in text and "#EXT-X-PLAYLIST-TYPE:VOD" not in text
+    if "#EXT-X-ENDLIST" not in text:
+        out.append("#EXT-X-ENDLIST")       # or ffmpeg treats the local copy as live and waits for more
+    first = next(sg for sg in segs if sg.kind in ("media", "encrypted"))
+    if needs_query(http, first.url, final):
+        for sg in segs:
+            sg.url = inherit_query(sg.url, final)
     return MediaPlaylist("\n".join(out) + "\n", segs, "#EXT-X-BYTERANGE" in text, live), variant
 
 
@@ -1174,17 +1215,14 @@ def part_of(dest: Path) -> Path:
     return dest.with_name(dest.name + ".part")
 
 
-def looks_valid(data_head: bytes, kind: str, suffix: str) -> bool:
+def looks_valid(data_head: bytes, kind: str, ts: bool) -> bool:
     """Reject error pages that came back with status 200. Keys and encrypted segments are random
     bytes, so only plain segments get the format check."""
     if kind in ("key", "encrypted"):
         return True
-    head = data_head.lstrip()[:1]
-    if head in (b"<", b"{"):
+    if data_head.lstrip()[:1] in (b"<", b"{"):
         return False
-    if suffix == ".ts":
-        return data_head[:1] == b"G"          # MPEG-TS sync byte
-    return True
+    return data_head[:1] == b"G" if ts else True      # MPEG-TS sync byte
 
 
 def segment_ok(seg: Segment) -> bool:
@@ -1193,7 +1231,7 @@ def segment_ok(seg: Segment) -> bool:
         if seg.dest.stat().st_size == 0:
             return False
         with open(seg.dest, "rb") as fh:
-            return looks_valid(fh.read(16), seg.kind, seg.dest.suffix)
+            return looks_valid(fh.read(16), seg.kind, seg.ts)
     except OSError:
         return False
 
@@ -1257,7 +1295,7 @@ def download_requests(http: Http, segs: list[Segment], jobs: int) -> None:
             try:
                 with http.s.get(seg.url, stream=True, timeout=30) as r:
                     r.raise_for_status()
-                    expected = as_int(r.headers.get("Content-Length"), -1)
+                    expected = -1 if r.headers.get("Content-Encoding") else as_int(r.headers.get("Content-Length"), -1)
                     got = 0
                     with open(part, "wb") as fh:
                         for chunk in r.iter_content(1 << 16):
@@ -1310,12 +1348,16 @@ def download_segments(http: Http, segs: list[Segment], opts, aria2: Optional[str
 # ffmpeg
 # --------------------------------------------------------------------------- #
 
-def run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
-    """(ok, last lines of stderr, redacted: ffmpeg quotes the URLs it reads)."""
+def run_ffmpeg(cmd: list[str], proxy: Optional[str] = None) -> tuple[bool, str]:
+    """(ok, last lines of stderr, redacted: ffmpeg quotes the URLs it reads). An HTTP proxy is passed
+    in the environment, so its password never shows in the process list."""
     if STOP.is_set():
         raise KeyboardInterrupt
+    env = None
+    if proxy and proxy.lower().startswith("http"):
+        env = {**os.environ, "http_proxy": proxy, "https_proxy": proxy}
     try:
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
     except OSError as e:
         return False, str(e)
     if p.returncode and STOP.wait(0.5):
@@ -1344,8 +1386,6 @@ def to_mp4(ffmpeg: str, video: MuxInput, out: Path, *, audio: Optional[MuxInput]
             args += ["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto,data"]
         if inp.remote:
             args += ["-user_agent", UA, "-headers", f"Referer: {SITE}/\r\n"]
-            if proxy and proxy.lower().startswith("http"):
-                args += ["-http_proxy", proxy]
         return args + ["-i", inp.path]
 
     attempts = []
@@ -1383,7 +1423,7 @@ def to_mp4(ffmpeg: str, video: MuxInput, out: Path, *, audio: Optional[MuxInput]
         for k, v in (tags or {}).items():
             cmd += ["-metadata", f"{k}={v}"]
         cmd.append(str(tmp))
-        ok, err = run_ffmpeg(cmd)
+        ok, err = run_ffmpeg(cmd, proxy if video.remote else None)
         if ok and tmp.is_file() and tmp.stat().st_size > 0:
             os.replace(tmp, out)
             return
@@ -1487,7 +1527,7 @@ def fetch_image(http: Http, ffmpeg: Optional[str], url: Optional[str], stem: Pat
     url = original_image(url)
     if not url or not url.startswith("http"):
         return None
-    jpg = stem.with_suffix(".jpg")
+    jpg = stem.with_name(stem.name + ".jpg")      # not with_suffix(): titles can contain dots
     if jpg.is_file() and jpg.stat().st_size > 0:
         return jpg
     try:
@@ -1510,7 +1550,7 @@ def fetch_image(http: Http, ffmpeg: Optional[str], url: Optional[str], stem: Pat
         if p.returncode == 0 and jpg.is_file():
             raw.unlink(missing_ok=True)
             return jpg
-    final = stem.with_suffix(ext)
+    final = stem.with_name(stem.name + ext)
     os.replace(raw, final)
     return final
 
@@ -1566,9 +1606,10 @@ class Progress:
 
     def owner(self, file: str) -> Optional[str]:
         """Id of the item that a file name already belongs to."""
+        stem = file[:-4] if file.endswith(".mp4") else file
+        names = (f"{stem}.mp4", f"{stem}.info.json", f"{stem}.ts")
         with self.lock:
-            row = self.db.execute("SELECT id FROM videos WHERE file = ? OR file LIKE ?",
-                                  (file, file.rsplit(".", 1)[0] + ".%")).fetchone()
+            row = self.db.execute("SELECT id FROM videos WHERE file IN (?, ?, ?)", names).fetchone()
         return row[0] if row else None
 
     def mark(self, key: str, state: str, **kw) -> None:
@@ -1611,8 +1652,10 @@ def item_input(key: str) -> str:
     """Progress key -> a line `-a` can read again (catch-up keeps its program id)."""
     kind, _, rest = key.partition(":")
     if kind == "catchup":
-        ch, _, prog = rest.partition(":")
-        return f"channel:{ch}  --program {prog.split(':')[0]}"
+        ch, _, rest = rest.partition(":")
+        prog, _, start = rest.partition(":")
+        when = parse_time(start)
+        return f"channel:{ch} --program {prog}" + (f" --date {when:%Y-%m-%d}" if when else "")
     return item_url(key)
 
 
@@ -1694,16 +1737,20 @@ def download_stream(ctx: Ctx, variant: Variant, out: Path, *, cover: Optional[Pa
     except OSError:
         shutil.rmtree(work, ignore_errors=True)
     if ".m3u8" in urlparse(variant.url).path:
-        work.mkdir(parents=True, exist_ok=True)
-        marker.write_text(sig, encoding="utf-8")
         vplan, variant = plan_media(ctx.http, variant, work, "v", ctx.opts.quality)
         if vplan.live:
-            shutil.rmtree(work, ignore_errors=True)
-            raise LiveStream()
+            # No end marker. Some packagers simply leave it out: only a playlist that still grows is live.
+            target = re.search(r"#EXT-X-TARGETDURATION:(\d+)", vplan.local_text)
+            STOP.wait(min(10.0, float(target.group(1)) if target else 4.0) + 1)
+            again, _ = plan_media(ctx.http, variant, work, "v", ctx.opts.quality)
+            if again.local_text != vplan.local_text:
+                raise LiveStream()
         aplan = None
         if variant.audio:
-            aplan, _ = plan_media(ctx.http, Variant(variant.audio), work, "a", ctx.opts.quality)
+            aplan, _ = plan_media(ctx.http, Variant(variant.audio, parent=variant.parent), work, "a", ctx.opts.quality)
         if not (vplan.byterange or (aplan and aplan.byterange)):
+            work.mkdir(parents=True, exist_ok=True)
+            marker.write_text(sig, encoding="utf-8")
             (work / "video.m3u8").write_text(vplan.local_text, encoding="utf-8")
             if aplan:
                 (work / "audio.m3u8").write_text(aplan.local_text, encoding="utf-8")
@@ -1721,6 +1768,9 @@ def download_stream(ctx: Ctx, variant: Variant, out: Path, *, cover: Optional[Pa
                 shutil.rmtree(work, ignore_errors=True)
             return
     # DASH, a single MP4 or byte-range HLS: let ffmpeg read the stream itself.
+    if ctx.opts.proxy and not ctx.opts.proxy.lower().startswith("http"):
+        log(warn(t("ffmpeg cannot use a SOCKS proxy: this stream is read without it",
+                   "ffmpeg không dùng được proxy SOCKS: luồng này được đọc không qua proxy")))
     status(t("  downloading with ffmpeg ...", "  đang tải bằng ffmpeg ..."))
     try:
         to_mp4(ctx.ffmpeg, MuxInput(variant.url, remote=True), out,
@@ -1780,17 +1830,23 @@ def record_live(ctx: Ctx, variant: Variant, refresh: Callable[[], list[Variant]]
     how_long = fmt_clock(bar.limit) if bar.limit else t("until Ctrl+C", "đến khi bấm Ctrl+C")
     log(gray(t(f"    recording {how_long} → {ts_path.name}", f"    đang ghi {how_long} → {ts_path.name}")))
 
-    def fetch(url: str) -> bytes:
+    def fetch(url: str, playlist: str) -> bytes:
+        is_ts = urlparse(url).path.lower().endswith(".ts")
         for attempt in range(4):
             try:
                 r = ctx.http.s.get(url, timeout=30)
-                if r.status_code == 200 and r.content and looks_valid(r.content[:16], "media", ".ts"):
+                if r.status_code in (401, 403) and inherit_query(url, playlist) != url:
+                    url = inherit_query(url, playlist)          # CDN wants the playlist's signature
+                    r = ctx.http.s.get(url, timeout=30)
+                if r.status_code == 200 and r.content and looks_valid(r.content[:16], "media", is_ts):
                     return r.content
             except requests.RequestException:
                 pass
             if STOP.wait(1 + attempt):
                 break
         return b""
+
+    idle_since = time.monotonic()
 
     try:
         with open(ts_path, "wb") as fh, bar:
@@ -1803,10 +1859,14 @@ def record_live(ctx: Ctx, variant: Variant, refresh: Callable[[], list[Variant]]
                     if failures > 6:
                         problem = t("the live stream stopped answering", "luồng trực tiếp không phản hồi")
                         break
+                    if failures < 2:             # one hiccup: just try the same link again
+                        STOP.wait(2)
+                        continue
                     try:                         # signed link expired: ask the API for a new one
                         fresh = closest(refresh(), height, ctx.opts.quality)
-                        media_url, height = fresh.url, fresh.height or height
-                        last_seq = -1            # sequence numbers may restart on a new link
+                        if fresh.url != media_url:
+                            media_url, height = fresh.url, fresh.height or height
+                            last_seq = -1        # sequence numbers may restart on a new link
                     except VtvgoError:
                         STOP.wait(3)
                     continue
@@ -1817,6 +1877,9 @@ def record_live(ctx: Ctx, variant: Variant, refresh: Callable[[], list[Variant]]
                     continue
                 if re.search(r"#EXT-X-KEY:.*METHOD=(?!NONE)", text):
                     problem = t("encrypted live stream, not supported", "luồng trực tiếp mã hoá, chưa hỗ trợ")
+                    break
+                if "#EXT-X-MAP" in text:
+                    problem = t("fMP4 / CMAF live stream, not supported", "luồng trực tiếp fMP4 / CMAF, chưa hỗ trợ")
                     break
                 m = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", text)
                 seq = int(m.group(1)) if m else 0
@@ -1831,13 +1894,20 @@ def record_live(ctx: Ctx, variant: Variant, refresh: Callable[[], list[Variant]]
                         seq += 1
                 if last_seq is None:
                     new = segs if ctx.opts.live_from_start else segs[-3:]
-                elif last_seq == -1 or (segs and segs[-1][0] < last_seq):
+                elif last_seq == -1 or (segs and segs[-1][0] < last_seq - max(len(segs), 3)):
                     new = segs[-1:]              # new link / restarted numbering: carry on from the edge
-                else:
+                else:                            # (a playlist slightly behind, from a lagging edge, adds nothing)
                     new = [s for s in segs if s[0] > last_seq]
                     if new and new[0][0] > last_seq + 1:
                         bar.gaps += 1
-                futures = [pool.submit(fetch, s[2]) for s in new]
+                target = re.search(r"#EXT-X-TARGETDURATION:(\d+)", text)
+                target_s = float(target.group(1)) if target else 4.0
+                if new:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since > max(30.0, 3 * target_s):
+                    problem = t("the live stream stopped sending new video", "luồng trực tiếp không còn phát hình mới")
+                    break
+                futures = [pool.submit(fetch, s[2], final) for s in new]
                 for (sq, d, _), fut in zip(new, futures):
                     while not fut.done():
                         time.sleep(0.05)
@@ -1854,8 +1924,7 @@ def record_live(ctx: Ctx, variant: Variant, refresh: Callable[[], list[Variant]]
                 fh.flush()
                 if (bar.limit and bar.recorded >= bar.limit) or "#EXT-X-ENDLIST" in text:
                     break
-                target = re.search(r"#EXT-X-TARGETDURATION:(\d+)", text)
-                STOP.wait(max(1.0, (float(target.group(1)) if target else 4.0) / 2))
+                STOP.wait(max(1.0, target_s / 2))
     except KeyboardInterrupt:
         stopped = True
         log(yellow(t("    stopping the recording ...", "    đang dừng ghi ...")))
@@ -1924,7 +1993,7 @@ def write_series(ctx: Ctx, series: dict, folder: Path) -> None:
     write_atomic(folder / "tvshow.nfo", tvshow_nfo(series))
     write_json(folder / "series.info.json", scrub(series))
     if not ctx.opts.no_images:
-        imgs = series.get("images") or {}
+        imgs = as_dict(series.get("images"))
         for kind, key in (("poster", "vertical"), ("fanart", "background"), ("landscape", "horizontal"),
                           ("banner", "horizontalBig")):
             fetch_image(ctx.http, ctx.ffmpeg, imgs.get(key), folder / kind)
@@ -1989,7 +2058,7 @@ def process_vod(ctx: Ctx, job: Job, n: int, total: int) -> str:
     # Metadata is written even when the stream is not available (e.g. it needs a plan).
     thumb = None
     if not opts.no_images:
-        imgs = detail.get("images") or {}
+        imgs = as_dict(detail.get("images"))
         thumb = fetch_image(ctx.http, ctx.ffmpeg, imgs.get("horizontal") or imgs.get("horizontalBig")
                             or src.get("firstImage") or imgs.get("background"), folder / f"{stem}-thumb")
         if not series:
@@ -2155,10 +2224,11 @@ def channel_nfo(ch: dict, title: str, plot: str, when: Optional[datetime], secon
                                   ("runtime", round(seconds / 60)), ("studio", ch.get("name")), ("genre", "TV")])
 
 
-def run_catchup(ctx: Ctx, ch: dict, folder: Path, cover: Optional[Path], counts: dict) -> None:
+def run_catchup(ctx: Ctx, ch: dict, folder: Path, cover: Optional[Path], counts: dict,
+                program: str, day: Optional[str]) -> None:
     opts = ctx.opts
     ch_id, name = ch["id"], ch.get("name") or ch["id"]
-    progs = select_programs(ctx.api, ch_id, opts.program, vn_day(opts.date))
+    progs = select_programs(ctx.api, ch_id, program, vn_day(day))
     log(bold(t(f"{name}: {len(progs)} program(s) to download", f"{name}: {len(progs)} chương trình cần tải")))
     for n, p in enumerate(progs, 1):
         if STOP.is_set():
@@ -2253,7 +2323,11 @@ def run_live(ctx: Ctx, ch: dict, session_id: str, folder: Path, cover: Optional[
     counts["done"] += 1
 
 
-def run_channel(ctx: Ctx, value: str, counts: dict) -> None:
+def run_channel(ctx: Ctx, value: str, counts: dict, own: Optional[dict] = None) -> None:
+    """One channel input: its EPG, catch-up (--program) or a live recording. `own` holds options
+    given on that input's line in a -a file."""
+    own = own or {}
+    program, day = own.get("program") or ctx.opts.program, own.get("date") or ctx.opts.date
     ch_id, _, session_id = value.partition("?")
     try:
         ch = dict(ctx.api.channels().get(ch_id) or {"id": ch_id, "name": ch_id})
@@ -2262,14 +2336,14 @@ def run_channel(ctx: Ctx, value: str, counts: dict) -> None:
     for k in ("platforms", "allowCastPlatforms"):
         ch.pop(k, None)
     if ctx.opts.epg:
-        print_epg(ctx.api, ch_id, ch.get("name") or ch_id, vn_day(ctx.opts.date))
+        print_epg(ctx.api, ch_id, ch.get("name") or ch_id, vn_day(day))
         return
     folder = ctx.root / "Channels" / sanitize(ch.get("name") or ch_id, 60)
     folder.mkdir(parents=True, exist_ok=True)
     cover = None if ctx.opts.no_images else fetch_image(ctx.http, ctx.ffmpeg, ch.get("thumbnail") or ch.get("logo"),
                                                          folder / "channel")
-    if ctx.opts.program:
-        run_catchup(ctx, ch, folder, cover, counts)
+    if program:
+        run_catchup(ctx, ch, folder, cover, counts, program, day)
     else:
         run_live(ctx, ch, session_id, folder, cover, counts)
 
@@ -2369,19 +2443,28 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def read_inputs(opts) -> list[str]:
-    """Links from the command line and from -a. A line from failed.txt may carry "--program <id>"."""
+def read_inputs(opts) -> list[tuple[str, dict]]:
+    """(link, options of its own) from the command line and from -a. A line of failed.txt may carry
+    "--program <id> --date <day>" for that one channel."""
     lines = list(opts.inputs)
     if opts.batch_file:
         lines += read_batch(Path(opts.batch_file))
     out = []
     for line in lines:
-        m = re.fullmatch(r"(\S+)\s+--program\s+(\S+)", line.strip())
-        if m:                                  # a catch-up line written to failed.txt
-            opts.program = ",".join(x for x in (opts.program, m.group(2)) if x)
-            line = m.group(1)
-        out.append(line.strip())
-    return [x for x in out if x]
+        words = line.split()
+        if not words:
+            continue
+        own: dict = {}
+        rest = words[1:]
+        while len(rest) >= 2 and rest[0] in ("--program", "--date"):
+            own[rest[0][2:]] = rest[1]
+            rest = rest[2:]
+        if rest:
+            raise ValueError(line)
+        if "date" in own:
+            vn_day(own["date"])
+        out.append((words[0], own))
+    return out
 
 
 def check_options(opts) -> None:
@@ -2428,13 +2511,16 @@ def main() -> int:
         parser.print_help()
         return 2
     channels, vods = [], []
-    for text in texts:
+    for text, own in texts:
         try:
             kind, value = parse_input(text)
         except ValueError:
             log(red(t(f"Not a vtvgo link or id: {text}", f"Không phải link/id vtvgo: {text}")))
             continue
-        (channels if kind == "channel" else vods).append((kind, value))
+        if kind == "channel":
+            channels.append((value, own))
+        else:
+            vods.append((kind, value))
 
     token, device_id = load_session(session_path)
     api = Api(token, opts.proxy, device_id)
@@ -2446,6 +2532,14 @@ def main() -> int:
             return 1
         if not channels and not vods:
             return 0
+    if opts.epg and not vods:                    # only the TV guide: nothing is written to disk
+        epg_ctx = Ctx(api, Http(opts.proxy), opts, Path(opts.output), None, None, None)
+        for value, own in channels:
+            try:
+                run_channel(epg_ctx, value, {}, own)
+            except VtvgoError as e:
+                log(red(f"{value}: {e}"))
+        return 0
 
     ffmpeg = find_ffmpeg()
     aria2 = None if opts.no_aria2c else find_tool("aria2c")
@@ -2466,13 +2560,14 @@ def main() -> int:
     ctx = Ctx(api, Http(opts.proxy), opts, root, progress, ffmpeg, aria2)
     counts = {"done": 0, "skip": 0, "error": 0}
     try:
-        for _, value in channels:
+        for value, own in channels:
             if STOP.is_set():
                 break
             try:
-                run_channel(ctx, value, counts)
-            except (VtvgoError, OSError) as e:
-                log(red(f"{value}: {one_line(e)}"))
+                run_channel(ctx, value, counts, own)
+            except Exception as e:                    # one bad channel must not end the whole run
+                status("")
+                log(red(f"{value}: {one_line(e) or type(e).__name__}"))
                 counts["error"] += 1
         jobs = collect_jobs(api, vods, opts) if vods and not STOP.is_set() else []
         if vods and not jobs:
@@ -2484,10 +2579,11 @@ def main() -> int:
                 break
             try:
                 counts[process_vod(ctx, job, n, len(jobs))] += 1
-            except (VtvgoError, OSError) as e:      # e.g. disk full, file locked: go on with the next one
+            except Exception as e:      # disk full, file locked, odd API data...: go on with the next one
                 status("")
-                log(fail_line(one_line(e)))
-                progress.mark(job.vod_id, "error", error=str(e))
+                msg = one_line(e) if isinstance(e, (VtvgoError, OSError)) else f"{type(e).__name__}: {one_line(e)}"
+                log(fail_line(msg))
+                progress.mark(job.vod_id, "error", error=msg)
                 counts["error"] += 1
     except KeyboardInterrupt:
         STOP.set()
