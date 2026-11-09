@@ -873,7 +873,7 @@ def expand(api: Api, kind: str, value: str, opts) -> list[Job]:
         return [Job(value)]
     if kind == "node":
         log(gray(t(f"  Listing catalog node {value} ...", f"  Đang liệt kê mục {value} ...")))
-        return [Job(i["id"], (sanitize(f"node {value}", 60),)) for i in api.node(value, opts.limit)]
+        return [Job(str(i["id"]), (sanitize(f"node {value}", 60),)) for i in api.node(value, opts.limit)]
     if kind == "section":
         block = api.section(value)
         if not block:
@@ -903,7 +903,11 @@ def expand(api: Api, kind: str, value: str, opts) -> list[Job]:
                             continue
                         queue.append((folder + (sanitize(sub_title, 60),), sub_blocks, depth + 1))
                 continue
-            ids = block_ids(api, b, opts.limit)
+            try:
+                ids = block_ids(api, b, opts.limit)
+            except VtvgoError as e:                 # one broken section must not lose the whole page
+                log(warn(f"{sanitize(b.get('title') or b.get('id'), 60)}: {e}"))
+                continue
             if ids:
                 name = sanitize(b.get("title") or b.get("id"), 60)
                 log(gray(f"    • {name}: {len(ids)}"))
@@ -1365,6 +1369,24 @@ def run_ffmpeg(cmd: list[str], proxy: Optional[str] = None) -> tuple[bool, str]:
     return p.returncode == 0, one_line(p.stderr.decode("utf-8", "replace")[-600:])
 
 
+_HLS_PICKY: dict[str, bool] = {}
+
+
+def hls_input_args(ffmpeg: str) -> list[str]:
+    """Input options for a local HLS playlist. Newer ffmpeg also checks each segment's extension against
+    its content ("extension_picky") and rejects names such as v00001.seg: turn that off where it exists
+    (older builds do not know the option and would fail on it)."""
+    if ffmpeg not in _HLS_PICKY:
+        try:
+            p = subprocess.run([ffmpeg, "-hide_banner", "-h", "demuxer=hls"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=30)
+            _HLS_PICKY[ffmpeg] = b"extension_picky" in p.stdout + p.stderr
+        except (OSError, subprocess.SubprocessError):
+            _HLS_PICKY[ffmpeg] = False
+    args = ["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto,data"]
+    return args + (["-extension_picky", "0"] if _HLS_PICKY[ffmpeg] else [])
+
+
 @dataclass
 class MuxInput:
     path: str                     # local file or URL
@@ -1383,7 +1405,7 @@ def to_mp4(ffmpeg: str, video: MuxInput, out: Path, *, audio: Optional[MuxInput]
     def source(inp: MuxInput) -> list[str]:
         args = []
         if inp.hls:
-            args += ["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto,data"]
+            args += hls_input_args(ffmpeg)
         if inp.remote:
             args += ["-user_agent", UA, "-headers", f"Referer: {SITE}/\r\n"]
         return args + ["-i", inp.path]
@@ -1423,7 +1445,14 @@ def to_mp4(ffmpeg: str, video: MuxInput, out: Path, *, audio: Optional[MuxInput]
         for k, v in (tags or {}).items():
             cmd += ["-metadata", f"{k}={v}"]
         cmd.append(str(tmp))
-        ok, err = run_ffmpeg(cmd, proxy if video.remote else None)
+        try:
+            ok, err = run_ffmpeg(cmd, proxy if video.remote else None)
+        except KeyboardInterrupt:
+            try:
+                tmp.unlink(missing_ok=True)    # no half-written .tmp.mp4 left in the library
+            except OSError:
+                pass
+            raise
         if ok and tmp.is_file() and tmp.stat().st_size > 0:
             os.replace(tmp, out)
             return
@@ -2134,12 +2163,21 @@ def vn_day(text: Optional[str]) -> str:
         return now.strftime("%Y-%m-%d")
     if text.lower() in ("yesterday", "homqua", "hom-qua"):
         return (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m"):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
         try:
-            d = datetime.strptime(text, fmt)
-            return (d.replace(year=now.year) if fmt == "%d/%m" else d).strftime("%Y-%m-%d")
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
+    # DD/MM: the nearest such day (31/12 typed on 2 January is last year's). Parsed with an explicit year:
+    # strptime without one warns on Python 3.13+ and rejects 29/02.
+    today, days = now.replace(tzinfo=None), []
+    for year in (now.year - 1, now.year, now.year + 1):
+        try:
+            days.append(datetime.strptime(f"{text}/{year}", "%d/%m/%Y"))
+        except ValueError:
+            continue
+    if days and text.count("/") == 1:
+        return min(days, key=lambda d: abs(d - today)).strftime("%Y-%m-%d")
     raise ValueError(text)
 
 
@@ -2246,7 +2284,13 @@ def run_catchup(ctx: Ctx, ch: dict, folder: Path, cover: Optional[Path], counts:
         row = dict(title=full, series=name, date=f"{st:%Y-%m-%d}", duration=int((en - st).total_seconds()))
         try:
             src = ctx.api.catchup_source(ch_id, p)
-            variant = pick_variant(list_variants(ctx.http, src), opts.quality)
+            variants = list_variants(ctx.http, src)
+            if opts.list_formats:               # -F: list only, never download
+                for v in sorted(variants, key=lambda v: (v.height, v.bandwidth), reverse=True):
+                    log(f"    {cyan(v.label)}  {gray(v.source)}")
+                counts["skip"] += 1
+                continue
+            variant = pick_variant(variants, opts.quality)
             log(f"    {t('quality', 'chất lượng')}: {green(variant.label)}")
             write_json(folder / f"{stem}.info.json", {
                 "channel": scrub(ch), "program": scrub(p), "format": variant.safe(), "playback": scrub(src),
@@ -2297,7 +2341,17 @@ def run_live(ctx: Ctx, ch: dict, session_id: str, folder: Path, cover: Optional[
         else:
             def refresh() -> list[Variant]:
                 return list_variants(ctx.http, ctx.api.channel_source(ch_id))
-        variant = pick_variant(refresh(), ctx.opts.quality)
+        variants = refresh()
+        if ctx.opts.list_formats or ctx.opts.metadata_only:      # neither of them records
+            if ctx.opts.list_formats:
+                for v in sorted(variants, key=lambda v: (v.height, v.bandwidth), reverse=True):
+                    log(f"    {cyan(v.label)}  {gray(v.source)}")
+            else:
+                log(gray(t("    --metadata-only: live stream not recorded",
+                           "    --metadata-only: không ghi luồng trực tiếp")))
+            counts["skip"] += 1
+            return
+        variant = pick_variant(variants, ctx.opts.quality)
         log(f"    {t('quality', 'chất lượng')}: {green(variant.label)}")
         label = f"{name} LIVE {now:%d/%m/%Y %H:%M}" + (f" - {what}" if what else "")
         stem = sanitize(f"{now:%Y-%m-%d} {name} LIVE" + (f" - {what}" if what else ""), 100)
