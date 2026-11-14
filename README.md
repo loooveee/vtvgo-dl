@@ -73,10 +73,13 @@ python vtvgo-dl.py -F https://vtvgo.vn/watch/576y
 | `--metadata-only` | metadata and artwork only |
 | `--no-images`, `--no-subs` | skip artwork or subtitles |
 | `-j 16` | parallel segment downloads |
+| `--no-aria2c` | download with requests even when aria2c is available |
+| `--keep-parts` | keep the downloaded segments after joining |
 | `--proxy URL` | proxy for all requests |
 | `-a file.txt` | read links from a file (one per line, `#` starts a comment) |
 | `--login` / `--logout` | log in / delete the saved session |
 | `--lang vi` | Vietnamese messages |
+| `--no-color` | no colors |
 
 ## TV channels, catch-up and live
 

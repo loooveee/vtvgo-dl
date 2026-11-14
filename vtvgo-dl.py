@@ -322,7 +322,7 @@ def sanitize(text, limit: int = 90) -> str:
     text = re.sub(r"\s+", " ", text).strip().rstrip(". ")
     if len(text) > limit:
         text = text[:limit].rstrip(". ")
-    if text.split(".")[0].upper() in _RESERVED:
+    if text.split(".")[0].strip().upper() in _RESERVED:
         text = f"_{text}"
     return text or "untitled"
 
@@ -348,7 +348,11 @@ def fit_folder(root: Path, parts: tuple) -> Path:
 
 
 _TOKEN_PATH = re.compile(r"/[A-Za-z0-9_-]{16,}/\d{10}(?=/)")     # /<signature>/<expiry>/ in CDN paths
-_SIGNED_QUERY = re.compile(r"(token|sig|hmac|hdnts|hdntl|policy|key-pair|expires|exp|auth|st|e|acl)=", re.I)
+# A query parameter that carries a signature: a name containing one of the long words, or exactly one
+# of the short ones ("type=", "size=" or "page=" are not signatures).
+_SIGNED_QUERY = re.compile(r"(?:^|&)(?:[^=&]*(?:token|sig|hmac|hdnts|hdntl|hdnea|policy|key-pair|expires|auth|credential)"
+                           r"[^=&]*|exp|st|e|acl)=", re.I)
+_USERINFO = re.compile(r"(?<=://)[^/@\s]+@")                     # user:password@ of a proxy URL
 _MEDIA_PATH = re.compile(r"\.(m3u8|mpd|ts|m4s|mp4|aac|key|vtt)$", re.I)
 _URL = re.compile(r"https?://[^\s\"'<>]+")
 _IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"                                   # IPv4
@@ -357,7 +361,7 @@ _IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"                                 
 
 
 def _redact_url(match: re.Match) -> str:
-    url = match.group(0)
+    url = _USERINFO.sub("", match.group(0), count=1)
     base, _, query = url.partition("?")
     base = _TOKEN_PATH.sub("/...", base)
     if query and (_MEDIA_PATH.search(base) or _SIGNED_QUERY.search(query)):
@@ -565,9 +569,16 @@ def login(path: Path) -> int:
                     store = {}
                 user = store.get("userInfo") if isinstance(store, dict) else None
                 raw = unquote(cookies.get("vtvgo.auth2.token", ""))
-                if raw and user and not user.get("isTempUser"):
+                if raw and isinstance(user, dict) and not user.get("isTempUser"):
                     token = raw
-                    device_id = page.evaluate("() => localStorage.getItem('vtvgo.deviceId.v2')")
+                    for _ in range(10):            # the page often reloads right after the login
+                        try:
+                            device_id = page.evaluate("() => localStorage.getItem('vtvgo.deviceId.v2')")
+                        except Exception:
+                            device_id = None
+                        if device_id or page.is_closed():
+                            break
+                        time.sleep(1)
                     break
                 time.sleep(1)
         except Exception:
@@ -794,8 +805,8 @@ class Api:
             data = self.request("GET", f"{DISPLAY}/catalogs/with-channels", params={"platform": PLATFORM})
             for grp in data.get("data") or []:
                 for ch in grp.get("channels") or []:
-                    if isinstance(ch, dict) and ch.get("id") and ch["id"] not in out:
-                        out[ch["id"]] = {**ch, "group": grp.get("name")}
+                    if isinstance(ch, dict) and ch.get("id") and str(ch["id"]) not in out:
+                        out[str(ch["id"])] = {**ch, "id": str(ch["id"]), "group": grp.get("name")}
             self._channels = out
         return self._channels
 
@@ -835,7 +846,7 @@ def parse_input(text: str) -> tuple[str, str]:
     if re.fullmatch(r"[A-Za-z0-9]{1,12}", text):
         return "watch", text
     u = urlparse(text if "://" in text else f"https://{text}")
-    if u.hostname and not u.hostname.endswith("vtvgo.vn"):
+    if u.hostname and u.hostname != "vtvgo.vn" and not u.hostname.endswith(".vtvgo.vn"):
         raise ValueError(text)
     parts = [unquote(p) for p in u.path.split("/") if p]
     if len(parts) >= 2 and parts[0] == "watch":
@@ -1025,7 +1036,9 @@ class Http:
             try:
                 r = self.s.get(url, timeout=30)
                 if r.status_code == 200:
-                    return r.text, r.url
+                    # Playlists are UTF-8 by definition: no charset guessing (slow on long playlists),
+                    # and a BOM must not end up in the first line.
+                    return r.content.decode("utf-8-sig", "replace"), r.url
                 last = f"HTTP {r.status_code}"
                 if r.status_code in (401, 403) and parent and inherit_query(url, parent) != url:
                     url = inherit_query(url, parent)
@@ -1045,8 +1058,9 @@ def parse_master(text: str, base: str, source: str = "") -> list[Variant]:
         if ln.startswith("#EXT-X-MEDIA:"):
             a = attrs(ln)
             if a.get("TYPE") == "AUDIO" and a.get("URI"):
-                if a.get("GROUP-ID") not in audio or a.get("DEFAULT") == "YES":
-                    audio[a.get("GROUP-ID", "")] = urljoin(base, a["URI"])
+                gid = a.get("GROUP-ID", "")
+                if gid not in audio or a.get("DEFAULT") == "YES":
+                    audio[gid] = urljoin(base, a["URI"])
     out = []
     for i, ln in enumerate(lines):
         if not ln.startswith("#EXT-X-STREAM-INF"):
@@ -1361,7 +1375,7 @@ def run_ffmpeg(cmd: list[str], proxy: Optional[str] = None) -> tuple[bool, str]:
     if proxy and proxy.lower().startswith("http"):
         env = {**os.environ, "http_proxy": proxy, "https_proxy": proxy}
     try:
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
     except OSError as e:
         return False, str(e)
     if p.returncode and STOP.wait(0.5):
@@ -1573,10 +1587,13 @@ def fetch_image(http: Http, ffmpeg: Optional[str], url: Optional[str], stem: Pat
     except (requests.RequestException, OSError):
         return None
     if ffmpeg:
-        p = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
-                            "-frames:v", "1", "-q:v", "2", str(jpg)], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-        if p.returncode == 0 and jpg.is_file():
+        try:
+            code = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
+                                   "-frames:v", "1", "-q:v", "2", str(jpg)], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        except OSError:
+            code = 1
+        if code == 0 and jpg.is_file():
             raw.unlink(missing_ok=True)
             return jpg
     final = stem.with_name(stem.name + ext)
@@ -1804,7 +1821,7 @@ def download_stream(ctx: Ctx, variant: Variant, out: Path, *, cover: Optional[Pa
     try:
         to_mp4(ctx.ffmpeg, MuxInput(variant.url, remote=True), out,
                audio=MuxInput(variant.audio, remote=True) if variant.audio else None,
-               cover=cover, tags=tags, proxy=ctx.opts.proxy)
+               cover=cover, subs=subs, tags=tags, proxy=ctx.opts.proxy)
     finally:
         status("")
     shutil.rmtree(work, ignore_errors=True)
@@ -2301,8 +2318,9 @@ def run_catchup(ctx: Ctx, ch: dict, folder: Path, cover: Optional[Path], counts:
                 continue
             out = folder / f"{stem}.mp4"
             download_stream(ctx, variant, out, cover=cover, tags=channel_tags(ch, full, desc, st, f"{SITE}/channel/{ch_id}"))
-        except (VtvgoError, LiveStream) as e:
-            msg = str(e) or t("the program is still being broadcast", "chương trình vẫn đang phát")
+        except (VtvgoError, LiveStream, OSError) as e:      # OSError: disk full, file locked...
+            status("")
+            msg = one_line(e) or t("the program is still being broadcast", "chương trình vẫn đang phát")
             log(fail_line(msg))
             ctx.progress.mark(key, "error", error=msg, **row)
             counts["error"] += 1
@@ -2525,6 +2543,8 @@ def check_options(opts) -> None:
     """Normalise option values; ValueError for a bad one."""
     opts.episodes = parse_ranges(opts.episodes)
     opts.duration = parse_duration(opts.duration)
+    if opts.duration is not None and opts.duration <= 0:
+        raise ValueError("--duration 0")
     vn_day(opts.date)
     opts.quality = str(opts.quality).lower().rstrip("p")
     if opts.quality not in ("best", "worst") and not opts.quality.isdigit():
@@ -2643,12 +2663,15 @@ def main() -> int:
         STOP.set()
     finally:
         status("")
-        failed = write_reports(progress, root)
+        try:
+            failed = write_reports(progress, root)
+        except OSError as e:               # read-only / full disk: still close the database cleanly
+            failed = 0
+            log(warn(t(f"could not write videos.csv / failed.txt: {one_line(e)}",
+                       f"không ghi được videos.csv / failed.txt: {one_line(e)}")))
         progress.close()
     if STOP.is_set():
         log(yellow(t("\nStopped. Run the same command again to resume.", "\nĐã dừng. Chạy lại đúng lệnh này để tải tiếp.")))
-    if opts.epg and not vods:
-        return 0
     log("")
     log(bold(t("Summary", "Tổng kết")) + f": {green(str(counts['done']))} {t('done', 'xong')}, "
         f"{counts['skip']} {t('skipped', 'bỏ qua')}, {red(str(counts['error'])) if counts['error'] else 0} "

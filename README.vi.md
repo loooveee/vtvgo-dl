@@ -73,10 +73,13 @@ python vtvgo-dl.py -F https://vtvgo.vn/watch/576y
 | `--metadata-only` | chỉ lưu metadata và ảnh |
 | `--no-images`, `--no-subs` | bỏ qua ảnh hoặc phụ đề |
 | `-j 16` | số đoạn tải song song |
+| `--no-aria2c` | tải bằng requests kể cả khi có aria2c |
+| `--keep-parts` | giữ lại các đoạn đã tải sau khi ghép |
 | `--proxy URL` | proxy cho mọi kết nối |
 | `-a file.txt` | đọc danh sách link từ file (mỗi dòng một link, `#` là ghi chú) |
 | `--login` / `--logout` | đăng nhập / xoá phiên đã lưu |
 | `--lang vi` | thông báo tiếng Việt |
+| `--no-color` | tắt màu |
 
 ## Kênh truyền hình, xem lại và trực tiếp
 
